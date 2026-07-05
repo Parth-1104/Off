@@ -17,18 +17,27 @@ mongoose.connect(uri)
 // Wallet schema tracking real locked fiat balances mapped to user hardware profiles
 const ActiveWalletSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
-  liveFrozenBalance: { type: Number, required: true, min: 0 }, 
-  clientPublicKey: { type: String, required: true } 
+  role: { type: String, enum: ['payer', 'merchant'], required: true },
+  liveFrozenBalance: { type: Number, default: 0 },
+  clientPublicKey: { type: String, default: "mock_device_public_key_rsa_0567" },
+  
+  // Dynamic Merchant Banking Routing Metadata
+  bankDetails: {
+    accountHolderName: { type: String, default: "" },
+    accountNumber: { type: String, default: "" },
+    ifscCode: { type: String, default: "" }
+  },
+  createdAt: { type: Date, default: Date.now }
 });
 
-// Settlement schema ensuring single-execution processing (Strict Idempotency)
 const SettlementRecordSchema = new mongoose.Schema({
-  transactionId: { type: String, required: true, unique: true }, 
+  transactionId: { type: String, required: true, unique: true },
+  invoiceNonce: { type: String, required: true, unique: true },
   payerId: { type: String, required: true },
   merchantId: { type: String, required: true },
   amount: { type: Number, required: true },
-  settledAt: { type: Date, default: Date.now },
-  status: { type: String, enum: ['SUCCESS', 'FRAUD_REJECTED'], required: true }
+  status: { type: String, enum: ['SUCCESS', 'FRAUD_REJECTED'], required: true },
+  settledAt: { type: Date, default: Date.now }
 });
 
 const ActiveWallet = mongoose.model('ActiveWallet', ActiveWalletSchema);

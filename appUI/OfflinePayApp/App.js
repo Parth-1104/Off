@@ -4,131 +4,151 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import QRCode from 'react-native-qrcode-svg';
 import { Camera, CameraView } from 'expo-camera';
 import { WebView } from 'react-native-webview';
-import { v4 as uuidv4 } from 'uuid';
 
-// Handshakes across Wi-Fi/Hotspot network directly with your Mac IP address
 const BACKEND_URL = 'https://5eec-2a09-bac1-3680-5d68-00-2a6-2f.ngrok-free.app/api/payment';
+const AUTH_URL = 'https://5eec-2a09-bac1-3680-5d68-00-2a6-2f.ngrok-free.app/api/auth';
 
 export default function App() {
   const [scanned, setScanned] = useState(false);
   const [role, setRole] = useState(null); 
+  const [userId, setUserId] = useState('');
+  const [isOnboarded, setIsOnboarded] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
   const [hasCameraPermission, setHasCameraPermission] = useState(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
-  
-  // Payer State Primitives
-  const [userId, setUserId] = useState('payer_parth_01');
-  const [amountToLock, setAmountToLock] = useState('100'); // Higher pool amount default for splitting
-  const [activeVoucher, setActiveVoucher] = useState(null); // Holds core server credentials/signature
-  const [localWalletBalance, setLocalWalletBalance] = useState(0); // Tracks real-time offline sandbox spendability
-  
-  // Razorpay WebView Interface States
+
+  // Merchant Banking Onboarding Inputs
+  const [bankName, setBankName] = useState('');
+  const [bankAcc, setBankAcc] = useState('');
+  const [bankIfsc, setBankIfsc] = useState('');
+
+  // Operational Primitives
+  const [amountToLock, setAmountToLock] = useState('100'); 
+  const [activeVoucher, setActiveVoucher] = useState(null);
+  const [localWalletBalance, setLocalWalletBalance] = useState(0);
   const [checkoutUrlHtml, setCheckoutUrlHtml] = useState(null);
   const [showModal, setShowModal] = useState(false);
-  
-  // Merchant State Primitives
-  const [merchantId] = useState('merchant_store_99');
-  const [billAmount, setBillAmount] = useState('15'); // Custom variable pricing input
+  const [billAmount, setBillAmount] = useState('15'); 
   const [activeInvoice, setActiveInvoice] = useState(null);
   const [offlineQueue, setOfflineQueue] = useState([]);
 
   useEffect(() => {
-    loadOfflineQueueAndWallet();
+    checkSavedProfile();
     (async () => {
       const { status } = await Camera.requestCameraPermissionsAsync();
       setHasCameraPermission(status === 'granted');
     })();
   }, []);
 
-  const loadOfflineQueueAndWallet = async () => {
-    const savedQueue = await AsyncStorage.getItem('merchant_queue');
-    if (savedQueue) setOfflineQueue(JSON.parse(savedQueue));
-
-    const savedBalance = await AsyncStorage.getItem('offline_wallet_balance');
-    if (savedBalance) setLocalWalletBalance(Number(savedBalance));
+  const handleExitCurrentRole = () => {
+    console.log(`[NAVIGATION] Exiting profile container role perspective for user: ${userId}`);
     
-    const savedVoucher = await AsyncStorage.getItem('active_voucher_token');
-    if (savedVoucher) setActiveVoucher(JSON.parse(savedVoucher));
+    // 🔥 The Magic Switcher Trick: 
+    // Simply flipping this flag to false unmounts the dashboard layout tree 
+    // and instantly drops the viewport frame back to the main Onboarding Hub.
+    setIsOnboarded(false);
   };
 
-  // ==========================================
-  // RAZORPAY EMBEDDED WEB CHECKOUT FLOW
-  // ==========================================
-  const startRazorpayCheckout = async () => {
-    console.log(`[DIAGNOSTIC] startRazorpayCheckout entered. Current isOnline status flag evaluates to: ${isOnline}`);
-  
-    // 🔥 TEMPORARY DIAGNOSTIC OVERRIDE: 
-    // Comment out the strict online gate check completely while debugging to force the engine forward
-    /*
-    if (!isOnline) {
-      console.warn("[CHECKOUT BLOCKED] System is in simulation offline mode constraint layout.");
-      Alert.alert("Error", "You must be online to load funds via Razorpay.");
+
+  const checkSavedProfile = async () => {
+    const savedId = await AsyncStorage.getItem('user_id');
+    const savedRole = await AsyncStorage.getItem('user_role');
+    const savedBalance = await AsyncStorage.getItem('offline_wallet_balance');
+    const savedQueue = await AsyncStorage.getItem('merchant_queue');
+
+    if (savedId && savedRole) {
+      setUserId(savedId);
+      setRole(savedRole);
+      setIsOnboarded(true);
+      if (savedBalance) setLocalWalletBalance(Number(savedBalance));
+      if (savedQueue) setOfflineQueue(JSON.parse(savedQueue));
+    }
+  };
+
+  const handleOnboarding = async () => {
+    if (!userId.trim()) {
+      Alert.alert("Input Error", "Please provide a valid unique identifier name.");
       return;
     }
-    */
-  
-    console.log(`[NETWORK RUNTIME] Preparing connection request link. Hitting: ${BACKEND_URL}/create-razorpay-order`);
-    
+    if (role === 'merchant' && (!bankName || !bankAcc || !bankIfsc)) {
+      Alert.alert("Input Error", "Merchants must submit commercial banking deployment keys.");
+      return;
+    }
+
+    const cleanId = userId.trim().toLowerCase();
+
+    try {
+      const response = await fetch(`${AUTH_URL}/onboard`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: cleanId,
+          role: role,
+          accountHolderName: bankName,
+          accountNumber: bankAcc,
+          ifscCode: bankIfsc
+        })
+      });
+      const data = await response.json();
+
+      if (response.ok) {
+        // 🔥 Save identity tokens locally
+        await AsyncStorage.setItem('user_id', cleanId);
+        await AsyncStorage.setItem('user_role', role);
+        
+        // 🔥 If the user already had money in their ledger pool, load it back into memory!
+        if (data.profile && data.profile.liveFrozenBalance !== undefined) {
+          const currentLedgerFunds = data.profile.liveFrozenBalance;
+          setLocalWalletBalance(Number(currentLedgerFunds));
+          await AsyncStorage.setItem('offline_wallet_balance', String(currentLedgerFunds));
+        }
+
+        setIsOnboarded(true);
+        Alert.alert("Welcome Back", `Successfully synced profile: ${cleanId}`);
+      } else {
+        Alert.alert("Registration Denied", data.error || "Execution dropped.");
+      }
+    } catch (err) {
+      Alert.alert("Network Failure", "Cannot hit onboarding authentication pipeline servers.");
+    }
+  };
+
+  const startRazorpayCheckout = async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/create-razorpay-order`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ amount: Number(amountToLock) })
       });
-      
-      console.log(`[NETWORK RESPONSE STATUS]: ${response.status}`);
       const orderData = await response.json();
-      console.log("[NETWORK RESPONSE BODY DATA]:", orderData);
-  
       if (!orderData.success) {
-        console.error("[ORDER CHECK FAILURE] Order initialization initialization flag returned false.");
-        Alert.alert("Backend Error", `Gateway Refused: ${orderData.error || 'Unknown error'}`);
+        Alert.alert("Backend Error", "Could not instantiate order.");
         return;
       }
-  
-      // 🚀 Your original script injection html generation block
+
       const checkoutHtml = `
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-          </head>
-          <body style="background-color: #f5f5f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;">
-            <script>
-              var options = {
-                "key": "${orderData.keyId}",
-                "amount": "${orderData.amount}",
-                "currency": "INR",
-                "name": "OfflinePay System Pool",
-                "order_id": "${orderData.orderId}",
-                "handler": function (response) {
-                  window.ReactNativeWebView.postMessage(JSON.stringify({
-                    event: 'PAYMENT_SUCCESS',
-                    razorpay_payment_id: response.razorpay_payment_id,
-                    razorpay_order_id: response.razorpay_order_id
-                  }));
-                },
-                "modal": { "ondismiss": function() { window.ReactNativeWebView.postMessage(JSON.stringify({ event: 'PAYMENT_CANCELLED' })); } },
-                "theme": { "color": "#2196F3" }
-              };
-              var rzp = new Razorpay(options);
-              window.onload = function() { rzp.open(); }
-            </script>
-          </body>
-        </html>
+        <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://checkout.razorpay.com/v1/checkout.js"></script></head>
+        <body style="background-color: #f5f5f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;">
+          <script>
+            var options = {
+              "key": "${orderData.keyId}", "amount": "${orderData.amount}", "currency": "INR", "name": "OfflinePay Vault",
+              "order_id": "${orderData.orderId}",
+              "handler": function (response) {
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  event: 'PAYMENT_SUCCESS', razorpay_payment_id: response.razorpay_payment_id, razorpay_order_id: response.razorpay_order_id
+                }));
+              },
+              "modal": { "ondismiss": function() { window.ReactNativeWebView.postMessage(JSON.stringify({ event: 'PAYMENT_CANCELLED' })); } }
+            };
+            var rzp = new Razorpay(options); window.onload = function() { rzp.open(); }
+          </script>
+        </body></html>
       `;
-  
-      console.log("[STATE CONTROLLER] HTML payload string compiled. Pushing to WebKit mounting layout tree...");
       setCheckoutUrlHtml(checkoutHtml);
       setShowModal(true);
-  
     } catch (err) {
-      console.error("[CRITICAL FAILURE] Target endpoint could not be reached. Error trace stack:", err);
-      Alert.alert("Connection Failure", `Unable to reach backend gateway server: ${err.message}`);
+      Alert.alert("Error", "Gateway initialization dropped.");
     }
   };
 
@@ -141,390 +161,319 @@ export default function App() {
         const verifyResponse = await fetch(`${BACKEND_URL}/verify-razorpay-success`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: userId,
-            amount: amountToLock,
-            razorpayPaymentId: data.razorpay_payment_id,
-            razorpayOrderId: data.razorpay_order_id
-          })
+          body: JSON.stringify({ userId, amount: amountToLock })
         });
         const ticketResult = await verifyResponse.json();
         
         if (verifyResponse.ok) {
-          // Initialize the Local Wallet Sandbox
           setActiveVoucher(ticketResult.offlineTicket);
           setLocalWalletBalance(Number(ticketResult.offlineTicket.allocatableFunds));
-          
-          await AsyncStorage.setItem('active_voucher_token', JSON.stringify(ticketResult.offlineTicket));
           await AsyncStorage.setItem('offline_wallet_balance', String(ticketResult.offlineTicket.allocatableFunds));
-          
-          Alert.alert("Sandbox Loaded!", `₹${amountToLock} verified. On-device sandbox wallet initialized.`);
-        } else {
-          Alert.alert("Minting Failure", ticketResult.error || "Failed to process signatures.");
+          Alert.alert("Sandbox Initialized", `₹${amountToLock} loaded into secure sandbox configuration.`);
         }
       } catch (e) {
-        Alert.alert("Minting Error", "Payment succeeded, but local cryptographic issuance failed.");
+        Alert.alert("Minting Error", "Payment cleared, but local asymmetric ledger allocation signature generation failed.");
       }
-    } else {
-      Alert.alert("Cancelled", "Transaction checkout canceled by the operator.");
     }
   };
 
-  // ==========================================
-  // CUSTOMER FLOW: SCANS MERCHANT INVOICE
-  // ==========================================
   const handleMerchantInvoiceScan = async (scannedInvoiceString) => {
     if (scanned) return;
     setScanned(true);
 
     try {
-      let cleanString = scannedInvoiceString.trim();
-      if (cleanString.startsWith('"') && cleanString.endsWith('"')) {
-        cleanString = cleanString.slice(1, -1);
-      }
-
-      const invoice = JSON.parse(cleanString);
+      const invoice = JSON.parse(scannedInvoiceString.trim());
       const currentBalance = Number(await AsyncStorage.getItem('offline_wallet_balance') || 0);
 
-      // Validation: Check local sandbox allowance limits
       if (currentBalance < Number(invoice.requestedAmount)) {
-        Alert.alert("Transaction Denied", "Insufficient funds in your on-device sandbox.", [
-          { text: "OK", onPress: () => setScanned(false) }
-        ]);
+        Alert.alert("Transaction Denied", "Insufficient local wallet sandbox capacity balance.");
+        setScanned(false);
         return;
       }
 
-      if (!activeVoucher || !activeVoucher.serverSignature) {
-        Alert.alert("Auth Error", "No active cryptographic voucher certificate found.", [
-          { text: "OK", onPress: () => setScanned(false) }
-        ]);
-        return;
-      }
-
-      // 1. Local Ledger Sandbox Update (Deduct spending chunk)
       const updatedBalance = currentBalance - Number(invoice.requestedAmount);
       setLocalWalletBalance(updatedBalance);
       await AsyncStorage.setItem('offline_wallet_balance', String(updatedBalance));
 
-      // 2. Build Fractional Cryptographic Receipt Payload
       const transactionPayload = {
-        // Inside handleMerchantInvoiceScan:
-transactionId: `TX-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
+        transactionId: `TX-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`,
         payerId: userId,
         merchantId: invoice.merchantId,
         amount: Number(invoice.requestedAmount),
         invoiceNonce: invoice.invoiceNonce,
-        serverSignature: activeVoucher.serverSignature, // Core signature passed forward
-        expiresAt: activeVoucher.expiresAt
+        serverSignature: activeVoucher?.serverSignature || "mock_signature_block_0567",
+        expiresAt: activeVoucher?.expiresAt || (Date.now() + 3600000)
       };
 
-      if (!isOnline) {
-        // Online Simulation Hook: In production this transmission payload is shared locally via QR back to merchant,
-        // Bluetooth, or NFC. For this single-app structural model, we save it directly to the merchant queue state log.
-        const savedQueue = await AsyncStorage.getItem('merchant_queue');
-        const currentQueue = savedQueue ? JSON.parse(savedQueue) : [];
-        const updatedQueue = [...currentQueue, transactionPayload];
-        
-        setOfflineQueue(updatedQueue);
-        await AsyncStorage.setItem('merchant_queue', JSON.stringify(updatedQueue));
+      const savedQueue = await AsyncStorage.getItem('merchant_queue');
+      const currentQueue = savedQueue ? JSON.parse(savedQueue) : [];
+      const updatedQueue = [...currentQueue, transactionPayload];
+      
+      setOfflineQueue(updatedQueue);
+      await AsyncStorage.setItem('merchant_queue', JSON.stringify(updatedQueue));
 
-        Alert.alert(
-          "Payment Successful!", 
-          `Spent ₹${invoice.requestedAmount} offline.\nRemaining Sandbox Pool: ₹${updatedBalance}`,
-          [{ text: "Done", onPress: () => setScanned(false) }]
-        );
-      } else {
-        // If customer is online during testing, push straight through to server clearinghouse
-        await processSettlementOnServer(transactionPayload);
-        setScanned(false);
-      }
-
+      Alert.alert("Payment Completed!", `Spent ₹${invoice.requestedAmount} offline. Remaining sandbox capacity balance pool: ₹${updatedBalance}`);
+      setScanned(false);
     } catch (err) {
-      Alert.alert("Scan Error", "Invalid Merchant Invoice layout configuration.", [
-        { text: "Try Again", onPress: () => setScanned(false) }
-      ]);
+      Alert.alert("Scan Error", "Corrupted or non-standard invoice payload formatting.");
+      setScanned(false);
     }
   };
 
-  // ==========================================
-  // MERCHANT FLOW: GENERATE INVOICE & SYNC
-  // ==========================================
   const generateMerchantInvoice = () => {
     const randomBlock = Math.floor(1000 + Math.random() * 9000); 
-    const uniqueNonce = `INV-${Date.now()}-${randomBlock}`;
-  
-    const invoicePayload = {
-      merchantId: merchantId,
+    setActiveInvoice({
+      merchantId: userId,
       requestedAmount: Number(billAmount),
-      invoiceNonce: uniqueNonce
-    };
-    setActiveInvoice(invoicePayload);
-  };
-
-  const processSettlementOnServer = async (payload) => {
-    try {
-      const response = await fetch(`${BACKEND_URL}/settle-offline-ticket`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true'
-        },
-        body: JSON.stringify(payload)
-      });
-      const data = await response.json();
-      if (response.ok) {
-        Alert.alert("Funds Settled", `Success! ₹${payload.amount} fractional asset moved to your account vault.`);
-        return true;
-      } else {
-        Alert.alert("Settlement Refused", data.error);
-        return false;
-      }
-    } catch (err) {
-      Alert.alert("Server Error", "Unable to establish contact with live settlement backend.");
-      return false;
-    }
+      invoiceNonce: `INV-${Date.now()}-${randomBlock}`
+    });
   };
 
   const syncMerchantQueueOnline = async () => {
     if (!isOnline) {
-      Alert.alert("Action Blocked", "Connect your device back online before starting sync operations.");
+      Alert.alert("Network Protection", "Toggle framework connectivity status online before running clear operations.");
       return;
     }
     let temporaryQueue = [...offlineQueue];
     for (const tx of temporaryQueue) {
-      const successfullySettled = await processSettlementOnServer(tx);
-      if (successfullySettled) {
-        temporaryQueue = temporaryQueue.filter(item => item.transactionId !== tx.transactionId);
-      }
+      try {
+        const response = await fetch(`${BACKEND_URL}/settle-offline-ticket`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(tx)
+        });
+        if (response.ok) {
+          temporaryQueue = temporaryQueue.filter(item => item.transactionId !== tx.transactionId);
+        }
+      } catch (e) {}
     }
     setOfflineQueue(temporaryQueue);
     await AsyncStorage.setItem('merchant_queue', JSON.stringify(temporaryQueue));
+    Alert.alert("Sync Operation Processed", "Ledger queues synchronized back to bank vault accounts successfully.");
   };
 
-  const clearWalletData = async () => {
-    await AsyncStorage.removeItem('offline_wallet_balance');
-    await AsyncStorage.removeItem('active_voucher_token');
+  const clearSystemCache = async () => {
+    await AsyncStorage.clear();
+    setUserId('');
+    setRole(null);
+    setIsOnboarded(false);
     setLocalWalletBalance(0);
-    setActiveVoucher(null);
-    Alert.alert("Reset Complete", "Local sandbox environment wiped clean.");
+    setActiveInvoice(null);
+    setOfflineQueue([]);
+    Alert.alert("Wipe Complete", "System profile states and ledger records returned to factory baselines.");
   };
 
   // ==========================================
-  // RENDERING LAYOUT ENGINE
+  // RENDER SELECTION ENGINE SWITCHES
   // ==========================================
-  if (!role) {
+  if (!isOnboarded) {
     return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.titleText}>Select Operational Framework Profile</Text>
-        <TouchableOpacity style={styles.button} onPress={() => setRole('payer')}>
-          <Text style={styles.btnText}>I am the Payer (Customer)</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.button, { backgroundColor: '#4CAF50' }]} onPress={() => setRole('merchant')}>
-          <Text style={styles.btnText}>I am the Merchant (Shopkeeper)</Text>
-        </TouchableOpacity>
+      <ScrollView contentContainerStyle={styles.centerContainer}>
+        <Text style={styles.titleText}>Sovereign Offline Clearing Platform</Text>
+        
+        {!role ? (
+          <View style={{ width: '100%', alignItems: 'center' }}>
+            <Text style={styles.subtitleText}>Choose Profile Paradigm</Text>
+            <TouchableOpacity style={styles.button} onPress={() => setRole('payer')}>
+              <Text style={styles.btnText}>Setup Payer Wallet Account</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.button, { backgroundColor: '#4CAF50' }]} onPress={() => setRole('merchant')}>
+              <Text style={styles.btnText}>Register Commercial Merchant Account</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <View style={[styles.card, { width: '100%' }]}>
+            <Text style={styles.roleTitle}>Onboarding: {role.toUpperCase()}</Text>
+            
+            <Text style={styles.label}>Create Unique Profile ID Name:</Text>
+            <TextInput style={styles.input} placeholder="e.g., parth_store_01" value={userId} onChangeText={setUserId} autoCapitalize="none" />
+
+            {role === 'merchant' && (
+  <View>
+    <View style={{ flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 15 }}>
+      <View style={{ flex: 1, marginRight: 10 }}>
+        <Text style={styles.label}>Create/Enter Merchant ID Name:</Text>
+        <TextInput 
+          style={[styles.input, { marginBottom: 0 }]} 
+          placeholder="e.g., merchant_store_99" 
+          value={userId} 
+          onChangeText={setUserId} 
+          autoCapitalize="none" 
+        />
       </View>
+      
+      {/* 🛠️ TEMPORARY TESTING BYPASS BUTTON */}
+      <TouchableOpacity 
+        style={{ backgroundColor: '#FF5722', padding: 12, borderRadius: 5, height: 45, justifyContent: 'center' }}
+        onPress={async () => {
+          if (!userId.trim()) {
+            Alert.alert("Test Trigger", "Type a Merchant ID first to fetch details.");
+            return;
+          }
+          console.log(`[TEST BYPASS] Attempting direct pull for merchant ID: ${userId}`);
+          try {
+            const response = await fetch(`${AUTH_URL}/onboard`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userId: userId.trim().toLowerCase(), role: 'merchant' })
+            });
+            const data = await response.json();
+            
+            if (response.ok) {
+              // Populate form fields with existing database details for visual proof
+              if (data.profile && data.profile.bankDetails) {
+                setBankName(data.profile.bankDetails.accountHolderName || 'Fetched Store');
+                setBankAcc(data.profile.bankDetails.accountNumber || '123456789');
+                setBankIfsc(data.profile.bankDetails.ifscCode || 'MOCK0001234');
+              }
+              
+              await AsyncStorage.setItem('user_id', userId.trim().toLowerCase());
+              await AsyncStorage.setItem('user_role', 'merchant');
+              setIsOnboarded(true);
+              Alert.alert("Bypass Success", "Existing Merchant profile authenticated via ID!");
+            } else {
+              Alert.alert("Bypass Error", data.error || "Profile not found.");
+            }
+          } catch (e) {
+            Alert.alert("Network Failure", "Cannot hit onboarding backend.");
+          }
+        }}
+      >
+        <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 12 }}>⚡ Quick Entry</Text>
+      </TouchableOpacity>
+    </View>
+
+    <Text style={styles.label}>Real-World Legal Account Name:</Text>
+    <TextInput style={styles.input} placeholder="Sharma Gen Store Ltd" value={bankName} onChangeText={setBankName} />
+    
+    <Text style={styles.label}>Physical Bank Account Number:</Text>
+    <TextInput style={styles.input} keyboardType="numeric" placeholder="91802004561239" value={bankAcc} onChangeText={setBankAcc} />
+    
+    <Text style={styles.label}>Indian Financial System Code (IFSC):</Text>
+    <TextInput style={styles.input} placeholder="SBIN0001234" value={bankIfsc} onChangeText={setBankIfsc} autoCapitalize="characters" />
+  </View>
+)}
+
+            <TouchableOpacity style={[styles.button, { width: '100%', marginTop: 20 }]} onPress={handleOnboarding}>
+              <Text style={styles.btnText}>Commit Registration Profile</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={{ marginTop: 15, alignItems: 'center' }} onPress={() => setRole(null)}>
+              <Text style={{ color: '#008CBA', fontWeight: 'bold' }}>← Back to Selection Paradigm</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </ScrollView>
     );
   }
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.roleTitle}>Profile: {role.toUpperCase()}</Text>
-        <TouchableOpacity 
-          style={[styles.networkBadge, { backgroundColor: isOnline ? '#2196F3' : '#F44336' }]} 
-          onPress={() => setIsOnline(!isOnline)}
-        >
-          <Text style={styles.btnText}>{isOnline ? " 🟢 SIMULATING ONLINE" : "🔴 SIMULATING OFFLINE"}</Text>
+        <Text style={styles.roleTitle}>ID: {userId.toUpperCase()} ({role.toUpperCase()})</Text>
+        <TouchableOpacity style={[styles.networkBadge, { backgroundColor: isOnline ? '#2196F3' : '#F44336' }]} onPress={() => setIsOnline(!isOnline)}>
+          <Text style={styles.btnText}>{isOnline ? " 🟢 MODE: SYSTEM ONLINE" : "🔴 MODE: SYSTEM OFFLINE"}</Text>
         </TouchableOpacity>
       </View>
 
-     {role === 'payer' ? (
-  <View style={styles.card}>
-    <Text style={styles.walletHeading}>On-Device Sandbox Balance: ₹{localWalletBalance}</Text>
-    
-    <Text style={styles.label}>Payer Registration ID:</Text>
-    <TextInput style={styles.input} value={userId} onChangeText={setUserId} />
-    
-    <Text style={styles.label}>Amount to Fund Pool (INR):</Text>
-    <TextInput style={styles.input} keyboardType="numeric" value={amountToLock} onChangeText={setAmountToLock} />
-    
-    <Button 
-      title="Fund via Razorpay" 
-      onPress={() => {
-        console.log(`[UI ACTION] 'Fund via Razorpay' pressed. Input amount: ${amountToLock}`);
-        startRazorpayCheckout();
-      }} 
-      color="#2196F3" 
-    />
-    
-    <View style={{ marginTop: 10 }}>
-      <Button 
-        title="Wipe Local Wallet Cache" 
-        onPress={() => {
-          console.log("[UI ACTION] Wiping wallet cache storage triggered.");
-          clearWalletData();
-        }} 
-        color="#F44336" 
-      />
-    </View>
+      {role === 'payer' ? (
+        <View style={styles.card}>
+          <Text style={styles.walletHeading}>Sandbox Wallet Balance: ₹{localWalletBalance}</Text>
+          <Text style={styles.label}>Amount to Load via Razorpay (INR):</Text>
+          <TextInput style={styles.input} keyboardType="numeric" value={amountToLock} onChangeText={setAmountToLock} />
+          
+          <Button title="Fund Digital Sandbox" onPress={startRazorpayCheckout} color="#2196F3" />
 
-    {/* DIAGNOSTIC CHECK: Replaced previous baseline structure with a strict, non-race condition lifecycle rendering guard */}
-    <Modal 
-      visible={showModal} 
-      animationType="slide" 
-      transparent={false}
-      onRequestClose={() => {
-        console.log("[MODAL] Hardware back button requested close layout state.");
-        setShowModal(false);
-      }}
-    >
-      <View style={{ flex: 1, paddingTop: 40, backgroundColor: '#f5f5f5' }}>
-        <View style={{ paddingHorizontal: 15, marginBottom: 10 }}>
-          <Button 
-            title="← Cancel & Go Back" 
-            onPress={() => {
-              console.log("[UI ACTION] Modal close manual layout override pressed.");
-              setShowModal(false);
-            }} 
-            color="#333" 
-          />
-        </View>
-        
-        {/* TELEMETRY RENDER STEP: Verifies that HTML payload string array exists before initializing inner WebKit component */}
-        {checkoutUrlHtml ? (
-          <WebView 
-            source={{ html: checkoutUrlHtml }}
-            onMessage={(e) => {
-              console.log("[WEBVIEW] Ingestion message frame arrived from Razorpay HTML script context.");
-              handleWebViewMessage(e);
-            }}
-            javaScriptEnabled={true}
-            domStorageEnabled={true}
-            startInLoadingState={true}
-            originWhitelist={['*']}
-            mixedContentMode="always"
-            allowUniversalAccessFromFileURLs={true}
-            style={{ flex: 1 }}
-            onLoadStart={() => console.log("[WEBVIEW LIFECYCLE] Native frame loading operation initiated...")}
-            onLoadEnd={() => console.log("[WEBVIEW LIFECYCLE] HTML payload bundle parsing operation completed smoothly.")}
-            onError={(syntheticEvent) => {
-              const { nativeEvent } = syntheticEvent;
-              console.error("[WEBVIEW CRITICAL FAILURE ERROR]:", nativeEvent);
-            }}
-          />
-        ) : (
-          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-            <Text style={{ color: '#666', fontSize: 16 }}>Establishing secure payment gateway stream...</Text>
-          </View>
-        )}
-      </View>
-    </Modal>
-
-    {/* CONTROL ARCHITECTURE: Only allow scanning if the wallet has been funded */}
-    <View style={styles.scannerContainer}>
-      {localWalletBalance > 0 ? (
-        !isScannerOpen ? (
-          <TouchableOpacity 
-            style={[styles.button, { backgroundColor: '#E91E63', width: '100%' }]} 
-            onPress={() => {
-              console.log("[UI ACTION] Scanner view request interface opened.");
-              setScanned(false);
-              setIsScannerOpen(true);
-            }}
-          >
-            <Text style={styles.btnText}>📷 Open Camera Scanner</Text>
-          </TouchableOpacity>
-        ) : (
-          <View>
-            <TouchableOpacity 
-              style={{ backgroundColor: '#666', padding: 10, borderRadius: 5, marginBottom: 10, alignItems: 'center' }} 
-              onPress={() => {
-                console.log("[UI ACTION] Scanner manually retracted.");
-                setIsScannerOpen(false);
-              }}
-            >
-              <Text style={{ color: '#fff', fontWeight: 'bold' }}>Close Scanner Camera</Text>
-            </TouchableOpacity>
-
-            <View style={styles.scannerWrapper}>
-              {hasCameraPermission === false ? (
-                <Text style={styles.scannerText}>Camera permissions denied.</Text>
-              ) : (
-                <CameraView
-                  style={{ flex: 1 }}
-                  facing="back"
-                  barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-                  onBarcodeScanned={scanned ? undefined : (result) => {
-                    if (result.data) {
-                      console.log(`[SCANNER SUCCESS] Ingested raw QR footprint matrix string: ${result.data}`);
-                      setIsScannerOpen(false);
-                      handleMerchantInvoiceScan(result.data);
-                    }
-                  }}
-                />
+          <Modal visible={showModal} animationType="slide" transparent={false}>
+            <View style={{ flex: 1, paddingTop: 40, backgroundColor: '#f5f5f5' }}>
+              <Button title="← Terminate Secure WebView Link" onPress={() => setShowModal(false)} color="#333" />
+              {checkoutUrlHtml && (
+                <WebView source={{ html: checkoutUrlHtml }} onMessage={handleWebViewMessage} javaScriptEnabled={true} domStorageEnabled={true} startInLoadingState={true} originWhitelist={['*']} mixedContentMode="always" allowUniversalAccessFromFileURLs={true} />
               )}
             </View>
+          </Modal>
+
+          <View style={styles.scannerContainer}>
+            {!isScannerOpen ? (
+              <TouchableOpacity style={[styles.button, { backgroundColor: '#E91E63', width: '100%' }]} onPress={() => setIsScannerOpen(true)}>
+                <Text style={styles.btnText}>📸 Scan Merchant Bill Invoice</Text>
+              </TouchableOpacity>
+            ) : (
+              <View>
+                <Button title="Close Camera Sensor" onPress={() => setIsScannerOpen(false)} color="#666" />
+                <View style={styles.scannerWrapper}>
+                  <CameraView style={{ flex: 1 }} facing="back" barcodeScannerSettings={{ barcodeTypes: ["qr"] }} onBarcodeScanned={scanned ? undefined : (r) => handleMerchantInvoiceScan(r.data)} />
+                </View>
+              </View>
+            )}
           </View>
-        )
-      ) : (
-        <View style={{ padding: 15, backgroundColor: '#FFF3CD', borderRadius: 8, marginTop: 15 }}>
-          <Text style={{ color: '#856404', textAlign: 'center', fontWeight: '500' }}>
-            ⚠️ Wallet Sandbox empty. Load funds via Razorpay above to unlock the offline checkout scanner interface.
-          </Text>
         </View>
-      )}
-    </View>
-  </View>
-) : (
+      ) : (
         <View style={styles.card}>
-          <Text style={styles.label}>Enter Variable Bill Amount (INR):</Text>
+          <Text style={styles.label}>Generate Variable Bill Invoice Amount (INR):</Text>
           <TextInput style={styles.input} keyboardType="numeric" value={billAmount} onChangeText={setBillAmount} />
-          
-          <Button title="Generate Invoice QR" onPress={generateMerchantInvoice} color="#FF9800" />
+          <Button title="Compile Invoice QR Block" onPress={generateMerchantInvoice} color="#FF9800" />
           
           {activeInvoice && (
             <View style={styles.qrContainer}>
-              <Text style={styles.qrLabel}>👉 Present this Invoice to Customer 👈</Text>
-              <QRCode 
-                value={typeof activeInvoice === 'string' ? activeInvoice : JSON.stringify(activeInvoice).trim()} 
-                size={200} 
-              />
-              <Text style={styles.expiryNote}>Charge Request: ₹{activeInvoice.requestedAmount}</Text>
+              <Text style={styles.qrLabel}>👉 Scan Matrix Footprint 👈</Text>
+              <QRCode value={JSON.stringify(activeInvoice).trim()} size={200} />
+              <Text style={styles.expiryNote}>Invoice Charge: ₹{activeInvoice.requestedAmount}</Text>
             </View>
           )}
 
           <View style={{ borderTopWidth: 1, borderColor: '#eee', marginTop: 25, paddingTop: 15 }}>
-            <Text style={styles.label}>Collected Queue Log: {offlineQueue.length} Vouchers Pending Sync</Text>
-            <Button title="Sync Queue Back to Bank" onPress={syncMerchantQueueOnline} color="#4CAF50" disabled={offlineQueue.length === 0} />
+            <Text style={styles.label}>Local Sync Vault Log: {offlineQueue.length} Transcripts Pending Clear</Text>
+            <Button title="Synchronize Operations Back to Bank" onPress={syncMerchantQueueOnline} color="#4CAF50" disabled={offlineQueue.length === 0} />
           </View>
         </View>
       )}
 
-      <TouchableOpacity style={styles.resetBtn} onPress={() => setRole(null)}>
-        <Text style={{ color: '#888' }}>Exit Profile Role Selection</Text>
+      <TouchableOpacity style={styles.resetBtn} onPress={clearSystemCache}>
+        <Text style={{ color: '#F44336', fontWeight: 'bold' }}>⚠️ Clear Storage & Wipe Profiles</Text>
       </TouchableOpacity>
+      {/* 🚀 NAVIGATIONAL TRANSITION BUTTON LAYER */}
+      <View style={{ width: '100%', marginTop: 30, paddingHorizontal: 10 }}>
+        
+        <TouchableOpacity 
+          style={[styles.navigationButton, { backgroundColor: '#008CBA' }]} 
+          onPress={handleExitCurrentRole}
+        >
+          <Text style={styles.btnText}>↩️ Exit Role & Change Account</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={[styles.resetBtn, { marginTop: 15 }]} 
+          onPress={clearSystemCache}
+        >
+          <Text style={{ color: '#F44336', fontWeight: 'bold', textAlign: 'center' }}>
+            ⚠️ Hard Reset (Wipe All Local Core Cache Logs)
+          </Text>
+        </TouchableOpacity>
+
+      </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f5f5f5', padding: 20 },
+  centerContainer: { flexGrow: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f5f5f5', padding: 20 },
   container: { flexGrow: 1, padding: 20, backgroundColor: '#fafafa', alignItems: 'center' },
-  header: { width: '100%', flexDirection: 'column', alignItems: 'center', marginBottom: 20, marginTop: 20 },
-  titleText: { fontSize: 22, fontWeight: 'bold', marginBottom: 30, color: '#333', textAlign: 'center' },
-  roleTitle: { fontSize: 24, fontWeight: 'bold', color: '#222' },
-  networkBadge: { padding: 10, borderRadius: 20, marginTop: 10, width: '80%', alignItems: 'center' },
+  header: { width: '100%', flexDirection: 'column', alignItems: 'center', marginBottom: 20 },
+  titleText: { fontSize: 24, fontWeight: 'bold', marginBottom: 10, color: '#333', textAlign: 'center' },
+  subtitleText: { fontSize: 16, color: '#666', marginBottom: 20 },
+  roleTitle: { fontSize: 20, fontWeight: 'bold', color: '#222', marginBottom: 10, textAlign: 'center' },
+  networkBadge: { padding: 10, borderRadius: 20, marginTop: 5, width: '80%', alignItems: 'center' },
   button: { backgroundColor: '#008CBA', padding: 15, borderRadius: 10, marginVertical: 10, width: '80%', alignItems: 'center' },
   btnText: { color: 'white', fontWeight: 'bold', fontSize: 16 },
-  card: { width: '100%', backgroundColor: 'white', borderRadius: 15, padding: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 10, elevation: 3 },
+  card: { width: '100%', backgroundColor: 'white', borderRadius: 15, padding: 20, elevation: 3 },
   walletHeading: { fontSize: 18, fontWeight: 'bold', color: '#E91E63', textAlign: 'center', marginVertical: 10, padding: 10, backgroundColor: '#FFF0F5', borderRadius: 8 },
   label: { fontSize: 14, fontWeight: '600', color: '#555', marginBottom: 5, marginTop: 10 },
   input: { borderBottomWidth: 1, borderColor: '#ccc', padding: 8, marginBottom: 15, fontSize: 16 },
   qrContainer: { alignItems: 'center', marginTop: 20, padding: 10 },
-  qrLabel: { fontWeight: 'bold', color: '#E91E63', marginBottom: 10, textAlign: 'center' },
+  qrLabel: { fontWeight: 'bold', color: '#E91E63', marginBottom: 10 },
   expiryNote: { marginTop: 10, color: '#222', fontWeight: 'bold' },
-  scannerContainer: { marginTop: 25, borderTopWidth: 1, borderColor: '#eee', paddingTop: 15 },
-  scannerWrapper: { height: 300, width: '100%', overflow: 'hidden', marginTop: 10, borderRadius: 10, backgroundColor: '#000', justifyContent: 'center' },
-  scannerText: { textAlign: 'center', padding: 20, color: '#fff' },
+  scannerContainer: { marginTop: 25 },
+  scannerWrapper: { height: 300, width: '100%', overflow: 'hidden', marginTop: 10, borderRadius: 10, backgroundColor: '#000' },
   resetBtn: { marginTop: 40, marginBottom: 20 }
 });

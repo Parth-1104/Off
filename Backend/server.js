@@ -77,6 +77,64 @@ app.post('/api/payment/create-razorpay-order', async (req, res) => {
 /**
  * STEP B: SUCCESSFUL VERIFICATION AND MINTING HOOK
  */
+/**
+ * SMART USER ONBOARDING & LOGIN GATEWAY (UPSERT)
+ */
+app.post('/api/auth/onboard', async (req, res) => {
+  const { userId, role, accountHolderName, accountNumber, ifscCode } = req.body;
+
+  if (!userId || !role) {
+    return res.status(400).json({ error: "Missing required core identity primitives." });
+  }
+
+  const normalizedId = userId.trim().toLowerCase();
+
+  try {
+    // 1. Check if this profile ID is already registered in the ledger system
+    let userProfile = await ActiveWallet.findOne({ userId: normalizedId });
+
+    if (userProfile) {
+      console.log(`[LOGIN RECOGNITION] Existing ${userProfile.role.toUpperCase()} session retrieved: ${normalizedId}`);
+      
+      // Optional: If they log back in with a different role, update it smoothly
+      if (userProfile.role !== role) {
+        userProfile.role = role;
+        if (role === 'merchant') {
+          userProfile.bankDetails = { accountHolderName, accountNumber, ifscCode };
+        }
+        await userProfile.save();
+        console.log(`[PROFILE UPDATED] Transitioned user role to: ${role.toUpperCase()}`);
+      }
+
+      return res.status(200).json({ 
+        success: true, 
+        message: "Profile recognized and authenticated successfully.",
+        profile: userProfile 
+      });
+    }
+
+    // 2. If it's a completely new user, initialize their ledger records fresh
+    userProfile = new ActiveWallet({
+      userId: normalizedId,
+      role: role,
+      liveFrozenBalance: 0,
+      bankDetails: role === 'merchant' ? { accountHolderName, accountNumber, ifscCode } : undefined
+    });
+
+    await userProfile.save();
+    console.log(`[ONBOARDING SUCCESS] Registered brand new ${role.toUpperCase()} Profile: ${normalizedId}`);
+    return res.status(201).json({ success: true, profile: userProfile });
+
+  } catch (error) {
+    console.error("[ONBOARDING ERROR]:", error);
+    return res.status(500).json({ error: "Onboarding routine malfunction: " + error.message });
+  }
+});
+
+
+
+
+
 app.post('/api/payment/verify-razorpay-success', async (req, res) => {
   const { userId, amount, razorpayPaymentId, razorpayOrderId } = req.body;
 

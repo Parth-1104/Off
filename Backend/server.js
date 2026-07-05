@@ -1,7 +1,8 @@
+require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const { ActiveWallet, SettlementRecord } = require('./database.js');
-require('dotenv').config();
+
 
 const app = express();
 app.use(express.json());
@@ -25,23 +26,41 @@ const razorpayInstance = new Razorpay({
 });
 
 /**
+ * HEALTH CHECK ENDPOINT
+ */
+app.get('/', async (req, res) => {
+  res.json({ msg: "well played" });
+});
+
+/**
  * STEP A: CREATE RAZORPAY ORDER
  */
-
-app.get('/',async(req,res)=>{
-  res.json({msg:"well played"})
-})
+/**
+ * STEP A: CREATE RAZORPAY ORDER
+ */
 app.post('/api/payment/create-razorpay-order', async (req, res) => {
-  const { amount } = req.body; // Expecting raw number like 10
+  const { amount } = req.body; 
   
+  // 🔥 FIX: Explicitly force type cast to integer to prevent NaN failures
+  const parsedAmount = Math.round(parseFloat(amount) * 100);
+
+  console.log(`[RAZORPAY] Attempting to create order for amount: ${amount} INR (${parsedAmount} Paisa)`);
+
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    console.error("[RAZORPAY ERROR] Invalid numeric value passed to order generator.");
+    return res.status(400).json({ success: false, error: "Invalid currency numeric value representation." });
+  }
+
   const options = {
-    amount: amount * 100, // Razorpay reads amounts in Paisa (10 INR = 1000 Paisa)
+    amount: parsedAmount, // Explicit parsed integer
     currency: "INR",
     receipt: `receipt_order_${Date.now()}`
   };
 
   try {
     const order = await razorpayInstance.orders.create(options);
+    console.log(`[RAZORPAY SUCCESS] Generated Order Reference: ${order.id}`);
+    
     return res.status(200).json({
       success: true,
       orderId: order.id,
@@ -49,6 +68,8 @@ app.post('/api/payment/create-razorpay-order', async (req, res) => {
       keyId: razorpayInstance.key_id
     });
   } catch (error) {
+    // 🔥 DIAGNOSTIC PRINT: Look at your Node console terminal to see exactly why Razorpay rejected it
+    console.error("[RAZORPAY API CRASH LOG]:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -71,19 +92,26 @@ app.post('/api/payment/verify-razorpay-success', async (req, res) => {
 
     // 2. Mint the mathematically signed cryptographic offline ticket
     const expiresAt = Date.now() + (12 * 60 * 60 * 1000); 
-    // FIXED: Ensured explicit Number cast to prevent signature mismatch gaps
     const tokenPayload = `${userId}|${Number(amount)}|${expiresAt}`;
 
     const signer = crypto.createSign('SHA256');
     signer.update(tokenPayload);
     signer.end();
-    const serverSignature = signer.sign(privateKey, 'hex');
+    const signatureHex = signer.sign(privateKey, 'hex');
 
     console.log(`[RAZORPAY PAYMENT VERIFIED] Order ${razorpayOrderId} loaded ₹${amount}. Secure offline capacity generated.`);
 
     return res.status(200).json({
       status: "LOCKED",
-      offlineTicket: { userId, allocatableFunds: Number(amount), expiresAt, serverSignature }
+      offlineTicket: { 
+        userId, 
+        allocatableFunds: Number(amount), 
+        expiresAt, 
+        serverSignature: {
+          originalPoolAmount: Number(amount), // Nested to allow structural string reconstruction on split settlement
+          signatureHex: signatureHex
+        }
+      }
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -92,7 +120,6 @@ app.post('/api/payment/verify-razorpay-success', async (req, res) => {
 
 /**
  * P2P LOCK VERIFICATION ENDPOINT
- * Evaluates individual customer deposit claims and secures the ledger allocations
  */
 app.post('/api/payment/verify-fiat-lock', async (req, res) => {
   const { userId, amount, txnRef } = req.body;
@@ -113,13 +140,21 @@ app.post('/api/payment/verify-fiat-lock', async (req, res) => {
     const signer = crypto.createSign('SHA256');
     signer.update(tokenPayload);
     signer.end();
-    const serverSignature = signer.sign(privateKey, 'hex');
+    const signatureHex = signer.sign(privateKey, 'hex');
 
     console.log(`[REAL MONEY DEPOSIT CLAIMED] Verified reference ${txnRef}. Allocated ₹${amount} offline capacity.`);
 
     return res.status(200).json({
       status: "LOCKED",
-      offlineTicket: { userId, allocatableFunds: Number(amount), expiresAt, serverSignature }
+      offlineTicket: { 
+        userId, 
+        allocatableFunds: Number(amount), 
+        expiresAt, 
+        serverSignature: {
+          originalPoolAmount: Number(amount),
+          signatureHex: signatureHex
+        }
+      }
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -151,7 +186,7 @@ app.post('/api/webhook/onmeta-success', async (req, res) => {
       const signer = crypto.createSign('SHA256');
       signer.update(tokenPayload);
       signer.end();
-      const serverSignature = signer.sign(privateKey, 'hex');
+      const signatureHex = signer.sign(privateKey, 'hex');
 
       console.log(`[ON-RAMP WEBHOOK SUCCESS] Minted secure offline token for ₹${fiatAmount}`);
 
@@ -159,7 +194,10 @@ app.post('/api/webhook/onmeta-success', async (req, res) => {
         userId,
         allocatableFunds: Number(fiatAmount),
         expiresAt,
-        serverSignature
+        serverSignature: {
+          originalPoolAmount: Number(fiatAmount),
+          signatureHex: signatureHex
+        }
       });
 
       return res.status(200).json({ message: "Webhook processed successfully." });
@@ -173,7 +211,7 @@ app.post('/api/webhook/onmeta-success', async (req, res) => {
 });
 
 /**
- * NEW ADJACENT ENDPOINT: FETCH MINTED TICKET
+ * FETCH MINTED TICKET ENDPOINT
  */
 app.get('/api/payment/get-ticket/:userId', (req, res) => {
   const { userId } = req.params;
@@ -188,66 +226,77 @@ app.get('/api/payment/get-ticket/:userId', (req, res) => {
 });
 
 /**
- * PHASE 2: LIVE OFFLINE TO ONLINE SETTLEMENT EXECUTION
+ * PHASE 2: LIVE OFFLINE TO ONLINE SPLIT-SETTLEMENT CLEARINGHOUSE
  */
 app.post('/api/payment/settle-offline-ticket', async (req, res) => {
-  const { transactionId, payerId, merchantId, amount, serverSignature, expiresAt } = req.body;
+  const { transactionId, payerId, merchantId, amount, invoiceNonce, serverSignature, expiresAt } = req.body;
 
   const session = await ActiveWallet.startSession();
   try {
     session.startTransaction();
 
-    const duplicateCheck = await SettlementRecord.findOne({ transactionId }).session(session);
+    // 1. Replay Attack Validation: Check for duplicate transaction ID or invoice nonce
+    const duplicateCheck = await SettlementRecord.findOne({ 
+      $or: [{ transactionId }, { invoiceNonce }] 
+    }).session(session);
+    
     if (duplicateCheck) {
       await session.abortTransaction();
-      return res.status(409).json({ error: "Transaction already processed and settled." });
+      return res.status(409).json({ error: "Transaction/Invoice already processed and settled." });
     }
 
-    // FIXED: Swapped out undefined 'userId' for the correct bound request parameter 'payerId'
-    const tokenPayload = `${payerId}|${Number(amount)}|${expiresAt}`;
+    // 2. CRYPTOGRAPHIC ASYMMETRIC SIGNATURE VALIDATION
+    // Reconstruct the payload base using original pool amount parameter to assert structural token match
+    const tokenPayload = `${payerId}|${Number(serverSignature.originalPoolAmount)}|${expiresAt}`;
     
     const verifier = crypto.createVerify('SHA256');
     verifier.update(tokenPayload);
     verifier.end();
 
-    const isAuthenticTicket = verifier.verify(publicKey, serverSignature, 'hex');
+    const isAuthenticTicket = verifier.verify(publicKey, serverSignature.signatureHex, 'hex');
     if (!isAuthenticTicket) {
       await session.abortTransaction();
-      return res.status(401).json({ error: "Cryptographic signature mismatch. Token corrupted or malicious." });
+      return res.status(401).json({ error: "Cryptographic signature mismatch. Token corrupted or altered." });
     }
 
+    // 3. Expiration Bounds Check
     if (Date.now() > Number(expiresAt)) {
       await session.abortTransaction();
       return res.status(410).json({ error: "Transaction ticket validity period expired." });
     }
 
+    // 4. LEDGER BALANCING WITH ESCROW RESERVES
     const payerWallet = await ActiveWallet.findOne({ userId: payerId }).session(session);
     if (!payerWallet || payerWallet.liveFrozenBalance < Number(amount)) {
+      // Create record documenting fraudulent overflow attempt
       await SettlementRecord.create([{
-        transactionId, payerId, merchantId, amount: Number(amount), status: 'FRAUD_REJECTED'
+        transactionId, invoiceNonce, payerId, merchantId, amount: Number(amount), status: 'FRAUD_REJECTED'
       }], { session });
 
       await session.commitTransaction();
       return res.status(403).json({ error: "Insufficient verified server funds. Re-sync denied due to double spending." });
     }
 
+    // Deduct the flexible, fractional transaction amount from the master holding account
     payerWallet.liveFrozenBalance -= Number(amount);
     await payerWallet.save({ session });
 
+    // Credit the corresponding merchant store ledger
     await ActiveWallet.findOneAndUpdate(
       { userId: merchantId },
       { $inc: { liveFrozenBalance: Number(amount) } },
       { session, upsert: true }
     );
 
+    // Save success audit trailing block
     await SettlementRecord.create([{
-      transactionId, payerId, merchantId, amount: Number(amount), status: 'SUCCESS'
+      transactionId, invoiceNonce, payerId, merchantId, amount: Number(amount), status: 'SUCCESS'
     }], { session });
 
     await session.commitTransaction();
     session.endSession();
 
-    console.log(`[REAL FUND PAYOUT SUCCESS] ₹${amount} moved from system vault to Merchant account ID: ${merchantId}`);
+    console.log(`[REAL FUND PAYOUT SUCCESS] ₹${amount} moved from vault pool to Merchant account ID: ${merchantId}`);
     return res.status(200).json({ status: "SETTLED", transactionId, amount: Number(amount) });
 
   } catch (error) {
@@ -257,5 +306,5 @@ app.post('/api/payment/settle-offline-ticket', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080; // Defaulting to your clean 8080 configuration channel
 app.listen(PORT, '0.0.0.0', () => console.log(`Production Ledger Active on Port ${PORT}`));
